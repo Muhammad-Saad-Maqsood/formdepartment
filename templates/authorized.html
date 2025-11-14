@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Capsule Builder</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background-color: #0f172a;
+        color: #f8fafc;
+      }
+      header {
+        padding: 1.25rem 2rem;
+        background: linear-gradient(90deg, #1d4ed8, #9333ea);
+        box-shadow: 0 4px 20px rgba(15, 23, 42, 0.35);
+      }
+      header h1 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+      main {
+        min-height: calc(100vh - 80px);
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        justify-content: center;
+      }
+      iframe {
+        flex: 1;
+        border: none;
+        width: 100%;
+        min-height: 100vh;
+      }
+      .meta {
+        padding: 1rem 2rem;
+        background: rgba(148, 163, 184, 0.15);
+        font-size: 0.875rem;
+      }
+      .meta strong {
+        color: #cbd5f5;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Capsule Builder</h1>
+      <p class="meta">
+        Access granted for customer <strong>{{ customer_id }}</strong>. Status: <strong>{{ status }}</strong>
+        {% if trial %}(Trial Access){% endif %}
+      </p>
+    </header>
+    <main>
+      <iframe src="{{ tool_url }}" title="Capsule Builder Tool" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+    </main>
+    <script>
+      window.ShopifyCustomer = {
+        customerId: "{{ customer_id }}",
+        status: "{{ status }}",
+        trial: {{ "true" if trial else "false" }}
+      };
+    </script>
+  </body>
+</html>
+

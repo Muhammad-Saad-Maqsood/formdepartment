@@ -3,3 +3,5 @@ gunicorn
 requests
 python-dotenv
 flask-cors
+sqlalchemy
+datetime

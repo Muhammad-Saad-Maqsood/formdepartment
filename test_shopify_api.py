@@ -6,6 +6,14 @@ import pandas as pd
 from dotenv import load_dotenv
 from config import load_settings
 
+
+SUBSCRIPTION_PRODUCT_IDS = {
+    8424668299439,  # Tier 1
+    8424683241647,  # Tier 2
+    8424226160815   # Pro Tier
+}
+
+
 # =====================================================
 # 1️⃣ Load Environment Variables
 # =====================================================
@@ -24,73 +32,90 @@ HEADERS = {
 # =====================================================
 
 def get_all_customers():
-    print("📦 Fetching all customers...")
+    print("📦 Fetching customers (filtered fields)...")
     all_customers = []
-    # base_url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/customers.json"
-    base_url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/customers.json"
+
+    url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/customers.json"
     params = {"limit": 250}
     next_page_info = None
 
     while True:
         if next_page_info:
-            params = {"limit": 250, "page_info": next_page_info}
+            params["page_info"] = next_page_info
 
-        response = requests.get(base_url, headers=HEADERS, params=params)
+        response = requests.get(url, headers=HEADERS, params=params)
         if response.status_code != 200:
             print(f"❌ Error {response.status_code}: {response.text}")
             break
 
-        data = response.json()
-        customers = data.get("customers", [])
-        all_customers.extend(customers)
+        data = response.json().get("customers", [])
+
+        # Extract ONLY required fields
+        for c in data:
+            all_customers.append({
+                "id": c.get("id"),
+                "first_name": c.get("first_name"),
+                "last_name": c.get("last_name"),
+                "email": c.get("email"),
+                "admin_graphql_api_id": c.get("admin_graphql_api_id")
+            })
 
         # Pagination
         link_header = response.headers.get("Link", "")
         if 'rel="next"' in link_header:
             match = re.search(r'page_info=([^&>]+)', link_header)
-            next_page_info = match.group(1) if match else None
+            next_page_info = match.group(1)
         else:
             break
-
-        print(f"Fetched {len(all_customers)} customers so far...")
 
     print(f"✅ Total customers fetched: {len(all_customers)}")
     return all_customers
 
 
 
+
 # =====================================================
 # 3️⃣ Fetch ALL ORDERS (Payments Data)
 # =====================================================
+
 def get_all_orders():
-    print("💰 Fetching all orders/payments...")
+    print("💰 Fetching orders (filtered fields)...")
     all_orders = []
-    base_url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/orders.json"
-    params = {"limit": 250, "status": "any"}  # include open/closed
+
+    url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/orders.json"
+    params = {"limit": 250, "status": "any"}
     next_page_info = None
 
     while True:
         if next_page_info:
-            params = {"limit": 250, "status": "any", "page_info": next_page_info}
+            params["page_info"] = next_page_info
 
-        response = requests.get(base_url, headers=HEADERS, params=params)
+        response = requests.get(url, headers=HEADERS, params=params)
         if response.status_code != 200:
             print(f"❌ Error {response.status_code}: {response.text}")
             break
 
-        data = response.json()
-        orders = data.get("orders", [])
-        all_orders.extend(orders)
+        data = response.json().get("orders", [])
+
+        for o in data:
+            line_items = o.get("line_items", [])
+
+            all_orders.append({
+                "order_id": o.get("id"),
+                "customer_id": o.get("customer", {}).get("id"),
+                "customer_first_name": o.get("customer", {}).get("first_name"),
+                "customer_last_name": o.get("customer", {}).get("last_name"),
+                "contact_email": o.get("contact_email"),
+                "line_item_0_product_id": line_items[0]["product_id"] if line_items else None,
+            })
 
         # Pagination
         link_header = response.headers.get("Link", "")
         if 'rel="next"' in link_header:
             match = re.search(r'page_info=([^&>]+)', link_header)
-            next_page_info = match.group(1) if match else None
+            next_page_info = match.group(1)
         else:
             break
-
-        print(f"Fetched {len(all_orders)} orders so far...")
 
     print(f"✅ Total orders fetched: {len(all_orders)}")
     return all_orders
@@ -99,6 +124,7 @@ def get_all_orders():
 # =====================================================
 # 4️⃣ GraphQL Query — Subscription Status per Customer
 # =====================================================
+
 def get_subscription_status(customer_gid):
     """
     Check if a customer has an active or trial subscription.
@@ -161,30 +187,28 @@ def get_subscription_status(customer_gid):
 # =====================================================
 # 5️⃣ Enrich Customers with Subscription Status
 # =====================================================
-# def add_subscription_status(customers):
-#     print("🔍 Checking subscription status for each customer...")
-#     enriched = []
-#     for i, cust in enumerate(customers):
-#         gid = cust.get("admin_graphql_api_id")
-#         email = cust.get("email", "")
-#         status = get_subscription_status(gid)
-#         cust["subscription_status"] = status
-#         enriched.append(cust)
-#         print(f"[{i+1}/{len(customers)}] {email or gid} → {status}")
-#         time.sleep(0.3)  # avoid Shopify API rate limits
-#     return enriched
+def map_customer_subscriptions(orders):
+    subscribed_customers = set()
 
-def add_subscription_status(customers, settings):
+    for order in orders:
+        pid = order.get("line_item_0_product_id")
+        cid = order.get("customer_id")
+
+        if pid in SUBSCRIPTION_PRODUCT_IDS and cid:
+            subscribed_customers.add(cid)
+
+    return subscribed_customers
+
+
+def add_subscription_status(customers, subscribed_customers):
     for customer in customers:
-        email = customer.get("email")
         cid = customer.get("id")
 
-        if cid in settings.master_customer_ids or email in settings.master_customer_emails:
+        if cid in subscribed_customers:
             customer["subscription_status"] = "Subscribed"
-        elif cid in settings.trial_customer_ids or email in settings.trial_customer_emails:
-            customer["subscription_status"] = "Trial"
         else:
             customer["subscription_status"] = "Inactive"
+
     return customers
 
 
@@ -232,14 +256,16 @@ def save_to_excel(customers, orders, file_name="shopify_data_full.xlsx"):
 # 8️⃣ Main Execution
 # =====================================================
 if __name__ == "__main__":
-    print("🚀 Starting Shopify Data Export (Customers + Subscriptions + Payments)...")
+    print("🚀 Starting Shopify Data Export (Customers + Subscription Flags + Payments)...")
 
     customers = get_all_customers()
-    if customers:
-        customers = add_subscription_status(customers, settings=load_settings())
-    else:
-        print("⚠️ No customers found.")
-
     orders = get_all_orders()
+
+    # Build subscription map from orders
+    subscribed_customers = map_customer_subscriptions(orders)
+
+    # Add subscription status
+    if customers:
+        customers = add_subscription_status(customers, subscribed_customers)
 
     save_to_excel(customers, orders)

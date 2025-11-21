@@ -6,5 +6,4 @@ flask-cors
 sqlalchemy
 datetime
 pandas
-time 
 re

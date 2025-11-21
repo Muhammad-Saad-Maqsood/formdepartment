@@ -2,6 +2,7 @@
 import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from flask_cors import CORS 
 
 from flask import Flask, request, jsonify, redirect
 from sqlalchemy import create_engine
@@ -20,6 +21,8 @@ load_dotenv()
 from config import load_settings
 settings = load_settings()
 
+
+
 # ---- Subscription product IDs (integers) ----
 TIER1_PRODUCT_ID = 8424668299439
 TIER2_PRODUCT_ID = 8424683241647
@@ -34,6 +37,12 @@ TOOL_URL = settings.tool_app_url
 
 # ---- Flask + DB setup ----
 app = Flask(__name__)
+
+# CORS setup
+CORS(app, origins=[
+    "https://capsule-builder-qhzx.vercel.app",
+    "https://formdepartment.com"
+])
 
 DB_PATH = os.getenv("SQLITE_PATH", "sqlite:///shopify_access.db")
 # create_engine accepts sqlite:///path; here we accept absolute or default relative file

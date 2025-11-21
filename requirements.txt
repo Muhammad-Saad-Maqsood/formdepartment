@@ -4,6 +4,4 @@ requests
 python-dotenv
 flask-cors
 sqlalchemy
-datetime
 pandas
-re

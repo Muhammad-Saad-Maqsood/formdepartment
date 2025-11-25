@@ -218,9 +218,24 @@ def proxy_tool():
         sess.close()
         return jsonify({"ok": False, "reason": "not_found", "redirect": "/account/login"}), 401
 
-    # If this is a trial request, bypass subscription validation
+    # If this is a trial request, check if trial has been used and bypass subscription validation
     if is_trial:
+        # Check if user has already used their free trial
+        if user.trial_used:
+            sess.close()
+            return jsonify({
+                "ok": False,
+                "reason": "trial_already_used",
+                "redirect": SUBSCRIPTION_PAGE,
+                "message": "You have already used your free trial. Please subscribe to continue."
+            }), 403
+        
+        # Mark trial as used
+        user.trial_used = True
+        sess.add(user)
+        sess.commit()
         sess.close()
+        
         return jsonify({
             "ok": True,
             "trial": True,

@@ -197,6 +197,10 @@ def proxy_tool():
     if not customer_id.isdigit() or len(customer_id) != 13:
         return jsonify({"ok": False, "reason": "invalid_customer_id", "message": "Customer id must be 13 digits."}), 400
 
+    # Check if this is a trial request
+    trial_param = request.args.get("trial", "").lower()
+    is_trial = trial_param == "true" or trial_param == "1"
+
     # 1) Refresh DB using Shopify data (synchronous)
     try:
         sync_from_shopify()
@@ -214,6 +218,17 @@ def proxy_tool():
         sess.close()
         return jsonify({"ok": False, "reason": "not_found", "redirect": "/account/login"}), 401
 
+    # If this is a trial request, bypass subscription validation
+    if is_trial:
+        sess.close()
+        return jsonify({
+            "ok": True,
+            "trial": True,
+            "plan": "trial",
+            "tool_url": TOOL_URL
+        }), 200
+
+    # Existing subscription validation logic (only for non-trial requests)
     now = datetime.utcnow()
 
     # expired or no plan

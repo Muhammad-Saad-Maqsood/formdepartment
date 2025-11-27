@@ -197,10 +197,6 @@ def proxy_tool():
     if not customer_id.isdigit() or len(customer_id) != 13:
         return jsonify({"ok": False, "reason": "invalid_customer_id", "message": "Customer id must be 13 digits."}), 400
 
-    # Check if this is a trial request
-    trial_param = request.args.get("trial", "").lower()
-    is_trial = trial_param == "true" or trial_param == "1"
-
     # 1) Refresh DB using Shopify data (synchronous)
     try:
         sync_from_shopify()
@@ -218,43 +214,102 @@ def proxy_tool():
         sess.close()
         return jsonify({"ok": False, "reason": "not_found", "redirect": "/account/login"}), 401
 
-    # If this is a trial request, check if trial has been used and bypass subscription validation
-    if is_trial:
-        # Check if user has already used their free trial
-        if user.trial_used:
-            sess.close()
-            return jsonify({
-                "ok": False,
-                "reason": "trial_already_used",
-                "redirect": SUBSCRIPTION_PAGE,
-                "message": "You have already used your free trial. Please subscribe to continue."
-            }), 403
-        
-        # Mark trial as used
+    # Always allow access to tool
+    # Show trial banner if trial hasn't been used yet (trial_used will be marked on first Schedule Call click)
+    
+    # Check subscription status for response info (but don't block access)
+    now = datetime.utcnow()
+    has_active_subscription = (
+        user.plan and 
+        user.plan != "none" and 
+        user.expiry and 
+        now <= user.expiry
+    )
+    
+    # Get plan info if subscribed
+    plan_info = None
+    if has_active_subscription:
+        if user.plan == "tier1":
+            plan_info = {"plan": "tier1", "remaining_uses": user.remaining_uses}
+        else:
+            plan_info = {"plan": user.plan}
+    
+    sess.close()
+    
+    # Always return ok=True to allow tool access
+    # Show trial banner if trial hasn't been used yet
+    return jsonify({
+        "ok": True,
+        "trial_used": user.trial_used,
+        "show_trial_banner": not user.trial_used,  # Show banner if trial not used yet
+        "has_subscription": has_active_subscription,
+        "plan": plan_info.get("plan") if plan_info else None,
+        "remaining_uses": plan_info.get("remaining_uses") if plan_info else None,
+        "tool_url": TOOL_URL
+    }), 200
+
+
+@app.route("/proxy/validate-submission", methods=["GET"])
+def validate_submission():
+    """
+    Validate if user can submit the form (Schedule a Call).
+    - First time (trial not used): Allow and mark trial as used
+    - After trial used: Check subscription status
+    """
+    customer_id = request.args.get("customer_id") or request.args.get("logged_in_customer_id")
+    if not customer_id:
+        return jsonify({"ok": False, "reason": "missing_customer_id"}), 400
+
+    if not customer_id.isdigit() or len(customer_id) != 13:
+        return jsonify({"ok": False, "reason": "invalid_customer_id"}), 400
+
+    # Refresh DB
+    try:
+        sync_from_shopify()
+    except Exception as exc:
+        print("Sync error:", exc)
+        return jsonify({"ok": False, "reason": "shopify_sync_failed", "message": str(exc)}), 500
+
+    cid = int(customer_id)
+    sess = Session()
+    user = sess.query(User).filter_by(customer_id=cid).first()
+
+    if not user:
+        sess.close()
+        return jsonify({"ok": False, "reason": "not_found"}), 401
+
+    # If trial not used yet, allow submission and mark trial as used
+    if not user.trial_used:
         user.trial_used = True
         sess.add(user)
         sess.commit()
         sess.close()
-        
         return jsonify({
             "ok": True,
-            "trial": True,
-            "plan": "trial",
-            "tool_url": TOOL_URL
+            "trial_just_used": True,
+            "message": "Trial submission allowed"
         }), 200
 
-    # Existing subscription validation logic (only for non-trial requests)
+    # Trial already used - check subscription
     now = datetime.utcnow()
+    has_active_subscription = (
+        user.plan and 
+        user.plan != "none" and 
+        user.expiry and 
+        now <= user.expiry
+    )
 
-    # expired or no plan
-    if not user.plan or user.plan == "none" or not user.expiry or now > user.expiry:
+    if not has_active_subscription:
         sess.close()
-        return jsonify({"ok": False, "reason": "no_active_subscription", "redirect": SUBSCRIPTION_PAGE}), 403
+        return jsonify({
+            "ok": False,
+            "reason": "no_active_subscription",
+            "redirect": SUBSCRIPTION_PAGE,
+            "message": "Subscribe to schedule your call"
+        }), 403
 
-    # tier1: enforce usage count
+    # User has active subscription - check tier1 usage limits
     if user.plan == "tier1":
-
-        # remaining_uses MUST already exist in DB
         if user.remaining_uses is None:
             sess.close()
             return jsonify({
@@ -263,16 +318,16 @@ def proxy_tool():
                 "message": "Tier1 user missing remaining_uses in DB"
             }), 500
 
-        # if exhausted
         if user.remaining_uses <= 0:
             sess.close()
             return jsonify({
                 "ok": False,
                 "reason": "tier1_exhausted",
-                "redirect": SUBSCRIPTION_PAGE
+                "redirect": SUBSCRIPTION_PAGE,
+                "message": "You have exhausted your usage limit. Please upgrade."
             }), 403
 
-        # decrement usage
+        # Decrement usage for tier1
         user.remaining_uses -= 1
         sess.add(user)
         sess.commit()
@@ -282,17 +337,14 @@ def proxy_tool():
         return jsonify({
             "ok": True,
             "plan": "tier1",
-            "remaining_uses": remaining,
-            "tool_url": TOOL_URL
+            "remaining_uses": remaining
         }), 200
 
-
-    # tier2 or tier3: unlimited access
+    # tier2 or pro: unlimited access
     sess.close()
     return jsonify({
         "ok": True,
-        "plan": user.plan,
-        "tool_url": TOOL_URL
+        "plan": user.plan
     }), 200
 
 

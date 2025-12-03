@@ -86,6 +86,11 @@ def upsert_user_from_shopify(sess, customer):
 # -----------------------
 # Sync logic (orders -> assign plans)
 # -----------------------
+
+# In-memory timestamp for the last successful Shopify sync.
+LAST_SYNC_AT = None
+
+
 def sync_from_shopify():
     """
     Fetch customers + orders from Shopify and update the local SQLite DB.
@@ -164,6 +169,25 @@ def sync_from_shopify():
     count = sess.query(User).count()
     sess.close()
     return {"synced_users": count, "updated_subscriptions": len(latest_purchase)}
+
+
+def ensure_recent_sync(max_age_seconds: int = 300):
+    """
+    Ensure we have synced from Shopify within the last `max_age_seconds`.
+    If not, perform a sync now.
+    This avoids doing a heavy full sync on *every* request while keeping
+    the local DB reasonably fresh.
+    """
+    global LAST_SYNC_AT
+    now = datetime.utcnow()
+
+    if LAST_SYNC_AT is None or (now - LAST_SYNC_AT).total_seconds() > max_age_seconds:
+        result = sync_from_shopify()
+        LAST_SYNC_AT = now
+        return result
+
+    # Already fresh enough; no-op.
+    return None
 
 
 # ---------------------------------------------------
@@ -277,9 +301,11 @@ def validate_submission():
     if not customer_id.isdigit() or len(customer_id) != 13:
         return jsonify({"ok": False, "reason": "invalid_customer_id"}), 400
 
-    # Refresh DB
+    # Refresh DB, but in a throttled way so validation stays fast.
+    # We only hit Shopify if our last successful sync is older than
+    # `max_age_seconds`. Adjust this if you need stricter freshness.
     try:
-        sync_from_shopify()
+        ensure_recent_sync(max_age_seconds=300)  # 5 minutes
     except Exception as exc:
         print("Sync error:", exc)
         return jsonify({"ok": False, "reason": "shopify_sync_failed", "message": str(exc)}), 500

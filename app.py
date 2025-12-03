@@ -197,15 +197,15 @@ def proxy_tool():
     if not customer_id.isdigit() or len(customer_id) != 13:
         return jsonify({"ok": False, "reason": "invalid_customer_id", "message": "Customer id must be 13 digits."}), 400
 
-    # 1) Refresh DB using Shopify data (synchronous)
-    try:
-        sync_from_shopify()
-    except Exception as exc:
-        # If Shopify fetch fails, be conservative and deny access (or choose to allow fallback)
-        print("Sync error:", exc)
-        return jsonify({"ok": False, "reason": "shopify_sync_failed", "message": str(exc)}), 500
-
-    # 2) Validate this customer in local DB
+    # NOTE:
+    # For redirect into the Capsule Builder we only need a **fast** check
+    # of whether the user has already used their free trial.
+    # A full Shopify sync here makes this endpoint very slow, so we now rely
+    # purely on the local SQLite data. The DB is refreshed via:
+    #   - the /admin/sync_shopify endpoint (cron / manual)
+    #   - the /proxy/validate-submission endpoint before paid validations
+    #
+    # 1) Validate this customer in local DB (no Shopify sync here)
     cid = int(customer_id)
     sess = Session()
     user = sess.query(User).filter_by(customer_id=cid).first()

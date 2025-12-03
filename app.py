@@ -197,22 +197,32 @@ def proxy_tool():
     if not customer_id.isdigit() or len(customer_id) != 13:
         return jsonify({"ok": False, "reason": "invalid_customer_id", "message": "Customer id must be 13 digits."}), 400
 
-    # NOTE:
-    # For redirect into the Capsule Builder we only need a **fast** check
-    # of whether the user has already used their free trial.
-    # A full Shopify sync here makes this endpoint very slow, so we now rely
-    # purely on the local SQLite data. The DB is refreshed via:
-    #   - the /admin/sync_shopify endpoint (cron / manual)
-    #   - the /proxy/validate-submission endpoint before paid validations
+    # NOTE: For this entrypoint we want the check to be **fast**.
+    # Do NOT run a full Shopify sync here; just use the local DB to
+    # determine if the user has already used their free trial.
     #
-    # 1) Validate this customer in local DB (no Shopify sync here)
+    # The heavier sync_from_shopify() call is still used on the
+    # `/proxy/validate-submission` endpoint where we must enforce
+    # up‑to‑date subscription status.
+
+    # Validate this customer in local DB
     cid = int(customer_id)
     sess = Session()
     user = sess.query(User).filter_by(customer_id=cid).first()
 
+    # If we don't yet have a record for this customer, create a minimal
+    # one locally so they can immediately access their free trial.
     if not user:
-        sess.close()
-        return jsonify({"ok": False, "reason": "not_found", "redirect": "/account/login"}), 401
+        user = User(
+            customer_id=cid,
+            plan="none",
+            plan_product_id=None,
+            expiry=None,
+            remaining_uses=None,
+            trial_used=False,
+        )
+        sess.add(user)
+        sess.commit()
 
     # Always allow access to tool
     # Show trial banner if trial hasn't been used yet (trial_used will be marked on first Schedule Call click)
@@ -234,25 +244,29 @@ def proxy_tool():
         else:
             plan_info = {"plan": user.plan}
     
+    # We’re done mutating the user; safe to close the session now.
     sess.close()
     
-    # Always return ok=True to allow tool access
-    # Show trial banner if trial hasn't been used yet
-    return jsonify({
-        "ok": True,
-        "trial_used": user.trial_used,
-        "show_trial_banner": not user.trial_used,  # Show banner if trial not used yet
-        "has_subscription": has_active_subscription,
-        "plan": plan_info.get("plan") if plan_info else None,
-        "remaining_uses": plan_info.get("remaining_uses") if plan_info else None,
-        "tool_url": TOOL_URL
-    }), 200
+    # Always return ok=True to allow tool access.
+    # The frontend only needs to know whether the trial was already used
+    # and where to send the user.
+    return jsonify(
+        {
+            "ok": True,
+            "trial_used": user.trial_used,
+            "show_trial_banner": not user.trial_used,
+            "has_subscription": has_active_subscription,
+            "plan": plan_info.get("plan") if plan_info else None,
+            "remaining_uses": plan_info.get("remaining_uses") if plan_info else None,
+            "tool_url": TOOL_URL,
+        }
+    ), 200
 
 
 @app.route("/proxy/validate-submission", methods=["GET"])
 def validate_submission():
     """
-    Validate if user can submit the form (Schedule a Call).
+    Validate if user can proceed to next step (called from Questionnaire Next button).
     - First time (trial not used): Allow and mark trial as used
     - After trial used: Check subscription status
     """
@@ -305,7 +319,7 @@ def validate_submission():
             "ok": False,
             "reason": "no_active_subscription",
             "redirect": SUBSCRIPTION_PAGE,
-            "message": "Subscribe to schedule your call"
+            "message": "Please subscribe to continue"
         }), 403
 
     # User has active subscription - check tier1 usage limits

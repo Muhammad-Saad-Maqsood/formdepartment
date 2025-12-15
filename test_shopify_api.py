@@ -299,10 +299,10 @@ if __name__ == "__main__":
 
     save_to_excel(customers, orders)
 
-def get_customer_email(customer_id: int) -> str | None:
+def get_customer_basic_info(customer_id: int) -> dict | None:
     """
-    Fetch a single customer's email from Shopify.
-    This is used ONLY to backfill missing emails (admin detection).
+    Fetch basic customer info from Shopify (email, first_name, last_name).
+    Used for lazy backfill only.
     """
     url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/customers/{customer_id}.json"
     response = requests.get(url, headers=HEADERS)
@@ -311,4 +311,8 @@ def get_customer_email(customer_id: int) -> str | None:
         return None
 
     customer = response.json().get("customer", {})
-    return customer.get("email")
+    return {
+        "email": customer.get("email"),
+        "first_name": customer.get("first_name"),
+        "last_name": customer.get("last_name"),
+    }

@@ -188,11 +188,15 @@ def proxy_tool():
         sess.commit()
 
     # 🔐 EMAIL BACKFILL (only once, only if missing)
-    if user.email is None:
+    # 🔐 BASIC INFO BACKFILL (email + first/last name, only once)
+    if user.email is None or user.first_name is None or user.last_name is None:
         try:
-            email = get_customer_email(cid)
-            if email:
-                user.email = email
+            from test_shopify_api import get_customer_basic_info
+            info = get_customer_basic_info(cid)
+            if info:
+                user.email = user.email or info.get("email")
+                user.first_name = user.first_name or info.get("first_name")
+                user.last_name = user.last_name or info.get("last_name")
                 sess.commit()
         except Exception:
             pass  # never block user flow
@@ -293,7 +297,8 @@ def admin_dashboard():
     for u in users:
         data.append({
             "customer_id": u.customer_id,
-            "full_name": f"{u.first_name or ''} {u.last_name or ''}".strip(),
+            "first_name": u.first_name,
+            "last_name": u.last_name,
             "email": u.email,
             "trial_used": u.trial_used,
             "plan": u.plan,

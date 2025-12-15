@@ -298,3 +298,17 @@ if __name__ == "__main__":
         customers = add_subscription_status(customers, subscribed_customers)
 
     save_to_excel(customers, orders)
+
+def get_customer_email(customer_id: int) -> str | None:
+    """
+    Fetch a single customer's email from Shopify.
+    This is used ONLY to backfill missing emails (admin detection).
+    """
+    url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/customers/{customer_id}.json"
+    response = requests.get(url, headers=HEADERS)
+
+    if response.status_code != 200:
+        return None
+
+    customer = response.json().get("customer", {})
+    return customer.get("email")

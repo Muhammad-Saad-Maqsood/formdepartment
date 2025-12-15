@@ -28,7 +28,7 @@ from test_shopify_api import (
     get_all_customers,
     get_all_orders,
     get_customer_orders,
-    get_customer_email,   # ✅ NEW (email backfill)
+    get_customer_basic_info,   # ✅ NEW (email backfill)
 )
 
 # -----------------------------

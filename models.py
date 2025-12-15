@@ -19,5 +19,12 @@ class User(Base):
     remaining_uses = Column(Integer, nullable=True) # integer for tier1, None for unlimited
     trial_used = Column(Boolean, default=False)
 
+    # Subscription bookkeeping (since you're using products as subscriptions)
+    # These let us refresh Shopify only when needed and correctly reset Tier1
+    # usage when a new subscription purchase happens.
+    last_shopify_check_at = Column(DateTime, nullable=True)
+    last_subscription_order_id = Column(BigInteger, nullable=True)
+    last_subscription_purchase_at = Column(DateTime, nullable=True)
+
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)

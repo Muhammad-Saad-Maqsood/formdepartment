@@ -102,11 +102,15 @@ def get_all_orders():
 
             all_orders.append({
                 "order_id": o.get("id"),
+                "created_at": o.get("created_at"),
                 "customer_id": o.get("customer", {}).get("id"),
                 "customer_first_name": o.get("customer", {}).get("first_name"),
                 "customer_last_name": o.get("customer", {}).get("last_name"),
                 "contact_email": o.get("contact_email"),
                 "line_item_0_product_id": line_items[0]["product_id"] if line_items else None,
+                # Keep ALL product IDs so subscription detection is correct when the subscription
+                # product is not the first line item.
+                "line_item_product_ids": [li.get("product_id") for li in line_items if li.get("product_id")],
             })
 
         # Pagination
@@ -119,6 +123,31 @@ def get_all_orders():
 
     print(f"✅ Total orders fetched: {len(all_orders)}")
     return all_orders
+
+
+# =====================================================
+# 3b️⃣ Fetch orders for ONE customer (fast path)
+# =====================================================
+
+def get_customer_orders(customer_id: int, limit: int = 25):
+    """Fetch a single customer's orders (status=any) with only the fields we need.
+
+    This is the correct call to use during validation instead of crawling the entire store.
+    """
+    url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/orders.json"
+    params = {
+        "status": "any",
+        "customer_id": int(customer_id),
+        "limit": min(int(limit), 250),
+        # created_at is required for expiry calculation
+        "fields": "id,created_at,line_items",
+    }
+
+    response = requests.get(url, headers=HEADERS, params=params)
+    if response.status_code != 200:
+        raise RuntimeError(f"Shopify orders lookup failed ({response.status_code}): {response.text}")
+
+    return response.json().get("orders", [])
 
 
 # =====================================================

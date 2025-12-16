@@ -117,11 +117,15 @@ def _parse_shopify_dt(iso_str: str) -> datetime:
 # -----------------------------
 # Per-customer subscription refresh (FAST)
 # -----------------------------
-def refresh_customer_subscription(sess, user: User, max_age_seconds: int = 300):
+def refresh_customer_subscription(sess, user: User, max_age_seconds: int = 300, force: bool = False):
     now = datetime.utcnow()
-    if user.last_shopify_check_at and (now - user.last_shopify_check_at).total_seconds() <= max_age_seconds:
-        return
 
+    # Skip refresh if not forced and recent check is valid
+    if not force and user.last_shopify_check_at:
+        if (now - user.last_shopify_check_at).total_seconds() <= max_age_seconds:
+            return
+
+    # Fetch customer orders from Shopify if forced or cache expired
     orders = get_customer_orders(int(user.customer_id), limit=50)
     latest = None
 
@@ -255,14 +259,104 @@ def validate_submission():
         sess.close()
         return jsonify({"ok": True, "plan": "admin"})
 
-    if not user.trial_used:
-        user.trial_used = True
-        sess.commit()
-        tool_cache.delete(f"tool:{cid}")
-        sess.close()
-        return jsonify({"ok": True, "trial_just_used": True})
+    # Force refresh when user is coming back from Shopify subscription page (important)
+    force = False
 
-    refresh_customer_subscription(sess, user)
+    # Force refresh if user plan is 'none' (meaning user was previously unsubscribed)
+    if user.plan == "none" or not user.expiry or (datetime.utcnow() > user.expiry):
+        force = True
+
+    # Trigger forced refresh if needed
+    refresh_customer_subscription(sess, user, force=force)
+
+    now = datetime.utcnow()
+    if not user.expiry or now > user.expiry:
+        sess.close()
+        return jsonify({"ok": False, "redirect": SUBSCRIPTION_PAGE}), 403
+
+    if user.plan == "tier1":
+        if user.remaining_uses <= 0:
+            sess.close()
+            return jsonify({"ok": False, "redirect": SUBSCRIPTION_PAGE}), 403
+        user.remaining_uses -= 1
+        sess.commit()
+
+    tool_cache.delete(f"tool:{cid}")
+    sess.close()
+    return jsonify({"ok": True, "plan": user.plan})
+
+@app.route("/proxy/validate-submission", methods=["GET"])
+def validate_submission():
+    customer_id = request.args.get("customer_id") or request.args.get("logged_in_customer_id")
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"ok": False}), 400
+
+    cid = int(customer_id)
+    sess = Session()
+    user = sess.query(User).filter_by(customer_id=cid).first()
+
+    if not user:
+        user = User(customer_id=cid, trial_used=False)
+        sess.add(user)
+        sess.commit()
+
+    if is_admin(user):
+        sess.close()
+        return jsonify({"ok": True, "plan": "admin"})
+
+    # Force refresh when user is coming back from Shopify subscription page (important)
+    force = False
+
+    # Force refresh if user plan is 'none' (meaning user was previously unsubscribed)
+    if user.plan == "none" or not user.expiry or (datetime.utcnow() > user.expiry):
+        force = True
+
+    # Trigger forced refresh if needed
+    refresh_customer_subscription(sess, user, force=force)
+
+    now = datetime.utcnow()
+    if not user.expiry or now > user.expiry:
+        sess.close()
+        return jsonify({"ok": False, "redirect": SUBSCRIPTION_PAGE}), 403
+
+    if user.plan == "tier1":
+        if user.remaining_uses <= 0:
+            sess.close()
+            return jsonify({"ok": False, "redirect": SUBSCRIPTION_PAGE}), 403
+        user.remaining_uses -= 1
+        sess.commit()
+
+    tool_cache.delete(f"tool:{cid}")
+    sess.close()
+    return jsonify({"ok": True, "plan": user.plan})
+@app.route("/proxy/validate-submission", methods=["GET"])
+def validate_submission():
+    customer_id = request.args.get("customer_id") or request.args.get("logged_in_customer_id")
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"ok": False}), 400
+
+    cid = int(customer_id)
+    sess = Session()
+    user = sess.query(User).filter_by(customer_id=cid).first()
+
+    if not user:
+        user = User(customer_id=cid, trial_used=False)
+        sess.add(user)
+        sess.commit()
+
+    if is_admin(user):
+        sess.close()
+        return jsonify({"ok": True, "plan": "admin"})
+
+    # Force refresh when user is coming back from Shopify subscription page (important)
+    force = False
+
+    # Force refresh if user plan is 'none' (meaning user was previously unsubscribed)
+    if user.plan == "none" or not user.expiry or (datetime.utcnow() > user.expiry):
+        force = True
+
+    # Trigger forced refresh if needed
+    refresh_customer_subscription(sess, user, force=force)
 
     now = datetime.utcnow()
     if not user.expiry or now > user.expiry:
@@ -310,6 +404,28 @@ def admin_dashboard():
 
     sess.close()
     return jsonify({"ok": True, "users": data})
+
+
+@app.route("/admin/sync-customers", methods=["POST"])
+def sync_customers():
+    if request.headers.get("X-ADMIN-TOKEN") != os.getenv("ADMIN_DASHBOARD_TOKEN"):
+        return jsonify({"ok": False, "reason": "Unauthorized"}), 401
+
+    # Fetch all Shopify customers and insert them into the DB
+    customers = get_all_customers()  # Your existing method
+    sess = Session()
+    for customer in customers:
+        user = sess.query(User).filter_by(customer_id=customer['id']).first()
+        if not user:
+            user = User(
+                customer_id=customer['id'],
+                email=customer['email'],
+                first_name=customer['first_name'],
+                last_name=customer['last_name'],
+            )
+            sess.add(user)
+    sess.commit()
+    return jsonify({"ok": True, "message": "Customers synced"})
 
 # -----------------------------
 # Health

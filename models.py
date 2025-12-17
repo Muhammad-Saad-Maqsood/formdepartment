@@ -13,13 +13,13 @@ class User(Base):
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
 
-    plan = Column(String, default="none")   # none | tier1 | tier2 | tier3
+    plan = Column(String, default="none")   # none | tier1 | tier2 | pro
     plan_product_id = Column(BigInteger, nullable=True)
     expiry = Column(DateTime, nullable=True)       # purchase_created_at + 30 days
     remaining_uses = Column(Integer, nullable=True) # integer for tier1, None for unlimited
     trial_used = Column(Boolean, default=False)
 
-    # Subscription bookkeeping (since you're using products as subscriptions)
+    # Subscription bookkeeping for optimized per-customer validation
     # These let us refresh Shopify only when needed and correctly reset Tier1
     # usage when a new subscription purchase happens.
     last_shopify_check_at = Column(DateTime, nullable=True)

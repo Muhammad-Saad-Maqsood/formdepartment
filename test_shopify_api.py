@@ -129,18 +129,17 @@ def get_all_orders():
 # 3b️⃣ Fetch orders for ONE customer (fast path)
 # =====================================================
 
-def get_customer_orders(customer_id: int, limit: int = 25):
+def get_customer_orders(customer_id: int, limit: int = 50):
     """Fetch a single customer's orders (status=any) with only the fields we need.
 
-    This is the correct call to use during validation instead of crawling the entire store.
+    This is the fast path to use during validation instead of fetching all store orders.
+    Returns the raw order objects with line_items included.
     """
     url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/orders.json"
     params = {
         "status": "any",
         "customer_id": int(customer_id),
         "limit": min(int(limit), 250),
-        # created_at is required for expiry calculation
-        "fields": "id,created_at,line_items",
     }
 
     response = requests.get(url, headers=HEADERS, params=params)
@@ -148,6 +147,29 @@ def get_customer_orders(customer_id: int, limit: int = 25):
         raise RuntimeError(f"Shopify orders lookup failed ({response.status_code}): {response.text}")
 
     return response.json().get("orders", [])
+
+
+# =====================================================
+# 3c️⃣ Fetch basic info for ONE customer
+# =====================================================
+
+def get_customer_basic_info(customer_id: int):
+    """
+    Fetch basic customer info from Shopify (email, first_name, last_name).
+    Used for lazy backfill of user profile data.
+    """
+    url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/customers/{customer_id}.json"
+    response = requests.get(url, headers=HEADERS)
+
+    if response.status_code != 200:
+        return None
+
+    customer = response.json().get("customer", {})
+    return {
+        "email": customer.get("email"),
+        "first_name": customer.get("first_name"),
+        "last_name": customer.get("last_name"),
+    }
 
 
 # =====================================================
@@ -298,21 +320,3 @@ if __name__ == "__main__":
         customers = add_subscription_status(customers, subscribed_customers)
 
     save_to_excel(customers, orders)
-
-def get_customer_basic_info(customer_id: int) -> dict | None:
-    """
-    Fetch basic customer info from Shopify (email, first_name, last_name).
-    Used for lazy backfill only.
-    """
-    url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2024-10/customers/{customer_id}.json"
-    response = requests.get(url, headers=HEADERS)
-
-    if response.status_code != 200:
-        return None
-
-    customer = response.json().get("customer", {})
-    return {
-        "email": customer.get("email"),
-        "first_name": customer.get("first_name"),
-        "last_name": customer.get("last_name"),
-    }

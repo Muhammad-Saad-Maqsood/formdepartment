@@ -77,6 +77,38 @@ Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
 # -----------------------------
+# Database migration for new columns
+# -----------------------------
+def migrate_database():
+    """Add new columns to existing database if they don't exist."""
+    from sqlalchemy import inspect, text
+    
+    inspector = inspect(engine)
+    existing_columns = [col['name'] for col in inspector.get_columns('users')]
+    
+    new_columns = {
+        'last_shopify_check_at': 'DATETIME',
+        'last_subscription_order_id': 'BIGINT',
+        'last_subscription_purchase_at': 'DATETIME',
+    }
+    
+    with engine.connect() as conn:
+        for col_name, col_type in new_columns.items():
+            if col_name not in existing_columns:
+                try:
+                    conn.execute(text(f'ALTER TABLE users ADD COLUMN {col_name} {col_type}'))
+                    conn.commit()
+                    print(f"Added column: {col_name}")
+                except Exception as e:
+                    print(f"Column {col_name} might already exist or error: {e}")
+
+# Run migration on startup
+try:
+    migrate_database()
+except Exception as e:
+    print(f"Migration error (may be safe to ignore): {e}")
+
+# -----------------------------
 # Tiny in-memory TTL cache
 # -----------------------------
 class TTLCache:
@@ -118,29 +150,49 @@ def _parse_shopify_dt(iso_str: str) -> datetime:
 # Per-customer subscription refresh (FAST)
 # -----------------------------
 def refresh_customer_subscription(sess, user: User, max_age_seconds: int = 300, force: bool = False):
+    """
+    Refresh a single customer's subscription status from Shopify.
+    This is much faster than syncing all customers/orders.
+    """
     now = datetime.utcnow()
 
     # Skip refresh if not forced and recent check is valid
-    if not force and user.last_shopify_check_at:
-        if (now - user.last_shopify_check_at).total_seconds() <= max_age_seconds:
-            return
+    try:
+        last_check = getattr(user, 'last_shopify_check_at', None)
+        if not force and last_check:
+            if (now - last_check).total_seconds() <= max_age_seconds:
+                return
+    except Exception:
+        pass  # Column might not exist yet
 
-    # Fetch customer orders from Shopify if forced or cache expired
-    orders = get_customer_orders(int(user.customer_id), limit=50)
+    # Fetch customer orders from Shopify
+    try:
+        orders = get_customer_orders(int(user.customer_id), limit=50)
+    except Exception as e:
+        print(f"Error fetching orders for customer {user.customer_id}: {e}")
+        return
+
     latest = None
 
     for o in orders:
         created = o.get("created_at")
         if not created:
             continue
-        created_dt = _parse_shopify_dt(created)
+        try:
+            created_dt = _parse_shopify_dt(created)
+        except Exception:
+            continue
         for li in o.get("line_items", []):
             pid = li.get("product_id")
             if pid in SUBSCRIPTION_PRODUCT_IDS:
                 if not latest or created_dt > latest[0]:
                     latest = (created_dt, o.get("id"), pid)
 
-    user.last_shopify_check_at = now
+    # Update last check time (safely)
+    try:
+        user.last_shopify_check_at = now
+    except Exception:
+        pass
 
     if not latest:
         user.plan = "none"
@@ -151,9 +203,16 @@ def refresh_customer_subscription(sess, user: User, max_age_seconds: int = 300, 
 
     created_dt, order_id, pid = latest
 
+    # Check if this is a new order
+    try:
+        last_order = getattr(user, 'last_subscription_order_id', None)
+        is_new_order = last_order != order_id
+    except Exception:
+        is_new_order = True
+
     if pid == TIER1_PRODUCT_ID:
         user.plan = "tier1"
-        if user.last_subscription_order_id != order_id:
+        if is_new_order:
             user.remaining_uses = TIER1_USES
     elif pid == TIER2_PRODUCT_ID:
         user.plan = "tier2"
@@ -164,8 +223,14 @@ def refresh_customer_subscription(sess, user: User, max_age_seconds: int = 300, 
 
     user.plan_product_id = pid
     user.expiry = created_dt + timedelta(days=ACCESS_DAYS)
-    user.last_subscription_order_id = order_id
-    user.last_subscription_purchase_at = created_dt
+    
+    # Update tracking fields (safely)
+    try:
+        user.last_subscription_order_id = order_id
+        user.last_subscription_purchase_at = created_dt
+    except Exception:
+        pass
+    
     sess.commit()
 
 # -----------------------------
@@ -283,127 +348,165 @@ def validate_submission():
     """
     Validate if user can proceed to next step (called from Questionnaire Next button).
     FLOW:
-    1. First time (trial not used): Allow and mark trial as used - FREE TRIAL
-    2. After trial used: Check subscription status from Shopify
+    1. Admin users: Always allowed (unlimited access)
+    2. First time (trial not used): Allow and mark trial as used - FREE TRIAL
+    3. After trial used: Check subscription status from Shopify
     """
-    customer_id = request.args.get("customer_id") or request.args.get("logged_in_customer_id")
-    if not customer_id:
-        return jsonify({"ok": False, "reason": "missing_customer_id"}), 400
-
-    if not customer_id.isdigit() or len(customer_id) != 13:
-        return jsonify({"ok": False, "reason": "invalid_customer_id"}), 400
-
-    cid = int(customer_id)
-    sess = Session()
-    user = sess.query(User).filter_by(customer_id=cid).first()
-
-    if not user:
-        user = User(customer_id=cid, trial_used=False, plan="none")
-        sess.add(user)
-        sess.commit()
-
-    # Admin bypass
-    if is_admin(user):
-        sess.close()
-        return jsonify({"ok": True, "plan": "admin"})
-
-    # ============================================================
-    # CRITICAL: FREE TRIAL FLOW
-    # If trial not used yet, allow submission and mark trial as used
-    # This is the FREE first use - no subscription required
-    # ============================================================
-    if not user.trial_used:
-        user.trial_used = True
-        sess.commit()
-        
-        # Invalidate cache so next /proxy/tool call shows updated trial_used status
-        tool_cache.delete(f"tool:{cid}")
-        
-        sess.close()
-        return jsonify({
-            "ok": True,
-            "trial_just_used": True,
-            "message": "Trial submission allowed"
-        }), 200
-
-    # ============================================================
-    # TRIAL ALREADY USED - Check subscription from Shopify
-    # ============================================================
-    
-    # Force refresh if user has no active subscription in DB
-    # (they might have just purchased one)
-    now = datetime.utcnow()
-    force_refresh = (
-        user.plan == "none" or 
-        user.plan is None or 
-        not user.expiry or 
-        now > user.expiry
-    )
-    
     try:
-        refresh_customer_subscription(sess, user, max_age_seconds=300, force=force_refresh)
-    except Exception as exc:
-        print(f"Subscription refresh error for {cid}: {exc}")
-        # Continue with existing DB data if refresh fails
+        customer_id = request.args.get("customer_id") or request.args.get("logged_in_customer_id")
+        if not customer_id:
+            return jsonify({"ok": False, "reason": "missing_customer_id"}), 400
 
-    # Re-check subscription status after refresh
-    has_active_subscription = (
-        user.plan and 
-        user.plan != "none" and 
-        user.expiry and 
-        now <= user.expiry
-    )
+        if not customer_id.isdigit() or len(customer_id) != 13:
+            return jsonify({"ok": False, "reason": "invalid_customer_id"}), 400
 
-    if not has_active_subscription:
-        sess.close()
+        cid = int(customer_id)
+        sess = Session()
+        
+        try:
+            user = sess.query(User).filter_by(customer_id=cid).first()
+
+            if not user:
+                user = User(customer_id=cid, trial_used=False, plan="none")
+                sess.add(user)
+                sess.commit()
+
+            # ============================================================
+            # ADMIN CHECK - Fetch email first if missing, then check admin
+            # ============================================================
+            if not user.email:
+                try:
+                    info = get_customer_basic_info(cid)
+                    if info and info.get("email"):
+                        user.email = info.get("email")
+                        user.first_name = info.get("first_name")
+                        user.last_name = info.get("last_name")
+                        sess.commit()
+                except Exception as e:
+                    print(f"Error fetching customer info: {e}")
+
+            # Admin bypass - unlimited access, no expiry
+            if is_admin(user):
+                tool_cache.delete(f"tool:{cid}")
+                sess.close()
+                return jsonify({
+                    "ok": True, 
+                    "plan": "admin",
+                    "is_admin": True,
+                    "message": "Admin access granted"
+                }), 200
+
+            # ============================================================
+            # CRITICAL: FREE TRIAL FLOW
+            # If trial not used yet, allow submission and mark trial as used
+            # This is the FREE first use - no subscription required
+            # ============================================================
+            if not user.trial_used:
+                user.trial_used = True
+                sess.commit()
+                
+                # Invalidate cache so next /proxy/tool call shows updated trial_used status
+                tool_cache.delete(f"tool:{cid}")
+                
+                sess.close()
+                return jsonify({
+                    "ok": True,
+                    "trial_just_used": True,
+                    "message": "Trial submission allowed"
+                }), 200
+
+            # ============================================================
+            # TRIAL ALREADY USED - Check subscription from Shopify
+            # ============================================================
+            
+            # Force refresh if user has no active subscription in DB
+            # (they might have just purchased one)
+            now = datetime.utcnow()
+            force_refresh = (
+                user.plan == "none" or 
+                user.plan is None or 
+                not user.expiry or 
+                now > user.expiry
+            )
+            
+            try:
+                refresh_customer_subscription(sess, user, max_age_seconds=300, force=force_refresh)
+            except Exception as exc:
+                print(f"Subscription refresh error for {cid}: {exc}")
+                # Continue with existing DB data if refresh fails
+
+            # Re-check subscription status after refresh
+            has_active_subscription = (
+                user.plan and 
+                user.plan != "none" and 
+                user.expiry and 
+                now <= user.expiry
+            )
+
+            if not has_active_subscription:
+                sess.close()
+                return jsonify({
+                    "ok": False,
+                    "reason": "no_active_subscription",
+                    "redirect": SUBSCRIPTION_PAGE,
+                    "message": "Please subscribe to continue"
+                }), 403
+
+            # User has active subscription - check tier1 usage limits
+            if user.plan == "tier1":
+                if user.remaining_uses is None:
+                    sess.close()
+                    return jsonify({
+                        "ok": False,
+                        "reason": "subscription_data_error",
+                        "message": "Tier1 user missing remaining_uses in DB"
+                    }), 500
+
+                if user.remaining_uses <= 0:
+                    sess.close()
+                    return jsonify({
+                        "ok": False,
+                        "reason": "tier1_exhausted",
+                        "redirect": SUBSCRIPTION_PAGE,
+                        "message": "You have exhausted your usage limit. Please upgrade."
+                    }), 403
+
+                # Decrement usage for tier1
+                user.remaining_uses -= 1
+                sess.commit()
+                remaining = user.remaining_uses
+                
+                # Invalidate cache
+                tool_cache.delete(f"tool:{cid}")
+                
+                sess.close()
+                return jsonify({
+                    "ok": True,
+                    "plan": "tier1",
+                    "remaining_uses": remaining
+                }), 200
+
+            # tier2 or pro: unlimited access
+            tool_cache.delete(f"tool:{cid}")
+            sess.close()
+            return jsonify({
+                "ok": True,
+                "plan": user.plan
+            }), 200
+            
+        except Exception as e:
+            sess.close()
+            raise e
+            
+    except Exception as e:
+        print(f"Validation error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "ok": False,
-            "reason": "no_active_subscription",
-            "redirect": SUBSCRIPTION_PAGE,
-            "message": "Please subscribe to continue"
-        }), 403
-
-    # User has active subscription - check tier1 usage limits
-    if user.plan == "tier1":
-        if user.remaining_uses is None:
-            sess.close()
-            return jsonify({
-                "ok": False,
-                "reason": "subscription_data_error",
-                "message": "Tier1 user missing remaining_uses in DB"
-            }), 500
-
-        if user.remaining_uses <= 0:
-            sess.close()
-            return jsonify({
-                "ok": False,
-                "reason": "tier1_exhausted",
-                "redirect": SUBSCRIPTION_PAGE,
-                "message": "You have exhausted your usage limit. Please upgrade."
-            }), 403
-
-        # Decrement usage for tier1
-        user.remaining_uses -= 1
-        sess.commit()
-        remaining = user.remaining_uses
-        
-        # Invalidate cache
-        tool_cache.delete(f"tool:{cid}")
-        
-        sess.close()
-        return jsonify({
-            "ok": True,
-            "plan": "tier1",
-            "remaining_uses": remaining
-        }), 200
-
-    # tier2 or pro: unlimited access
-    tool_cache.delete(f"tool:{cid}")
-    sess.close()
-    return jsonify({
-        "ok": True,
-        "plan": user.plan
-    }), 200
+            "reason": "server_error",
+            "message": str(e)
+        }), 500
 
 # -----------------------------
 # Admin dashboard endpoints
@@ -433,6 +536,12 @@ def admin_dashboard():
             now <= u.expiry
         )
         
+        # Safely get new columns that might not exist
+        try:
+            last_check = u.last_shopify_check_at.isoformat() if u.last_shopify_check_at else None
+        except Exception:
+            last_check = None
+        
         data.append({
             "customer_id": u.customer_id,
             "first_name": u.first_name,
@@ -443,7 +552,7 @@ def admin_dashboard():
             "subscription_active": subscription_active,
             "expiry": u.expiry.isoformat() if u.expiry else None,
             "remaining_uses": u.remaining_uses,
-            "last_shopify_check_at": u.last_shopify_check_at.isoformat() if u.last_shopify_check_at else None,
+            "last_shopify_check_at": last_check,
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "updated_at": u.updated_at.isoformat() if u.updated_at else None,
         })
@@ -623,9 +732,15 @@ def admin_sync_subscriptions():
 
         user.plan_product_id = pid
         user.expiry = created_dt + timedelta(days=ACCESS_DAYS)
-        user.last_subscription_order_id = order_id
-        user.last_subscription_purchase_at = created_dt
-        user.last_shopify_check_at = now
+        
+        # Safely set new columns
+        try:
+            user.last_subscription_order_id = order_id
+            user.last_subscription_purchase_at = created_dt
+            user.last_shopify_check_at = now
+        except Exception:
+            pass
+            
         updated_count += 1
 
     sess.commit()

@@ -59,7 +59,15 @@ CORS(app, origins=[
     "https://formdepartment.com",
 ])
 
-DB_PATH = os.getenv("SQLITE_PATH", "sqlite:///shopify_access.db")
+# Database path - use absolute path for persistence
+# For local dev, creates in backend folder
+# For production, set SQLITE_PATH env var to absolute path or use external DB
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "shopify_access.db")
+DB_PATH = os.getenv("SQLITE_PATH", f"sqlite:///{DEFAULT_DB_PATH}")
+
+print(f"📦 Database path: {DB_PATH}")
+
 engine = create_engine(DB_PATH, connect_args={"check_same_thread": False})
 
 @event.listens_for(engine, "connect")
@@ -73,8 +81,11 @@ def _sqlite_pragmas(dbapi_connection, _):
     except Exception:
         pass
 
+# Create all tables
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
+
+print(f"✅ Database initialized")
 
 # -----------------------------
 # Database migration for new columns
@@ -107,6 +118,163 @@ try:
     migrate_database()
 except Exception as e:
     print(f"Migration error (may be safe to ignore): {e}")
+
+
+# -----------------------------
+# Initialize database from Shopify on first run
+# -----------------------------
+def initialize_database_from_shopify():
+    """
+    Sync all customers and their subscription status from Shopify.
+    This should be called on first run or when database is empty.
+    """
+    print("🔄 Initializing database from Shopify...")
+    sess = Session()
+    
+    try:
+        # Fetch all customers from Shopify
+        print("📦 Fetching customers from Shopify...")
+        customers = get_all_customers()
+        
+        created_count = 0
+        for customer in customers:
+            cid = customer.get("id")
+            if not cid:
+                continue
+                
+            existing = sess.query(User).filter_by(customer_id=cid).first()
+            if not existing:
+                user = User(
+                    customer_id=cid,
+                    email=customer.get("email"),
+                    first_name=customer.get("first_name"),
+                    last_name=customer.get("last_name"),
+                    plan="none",
+                    trial_used=False,
+                )
+                sess.add(user)
+                created_count += 1
+        
+        sess.commit()
+        print(f"✅ Created {created_count} new users from Shopify customers")
+        
+        # Fetch all orders and update subscription status
+        print("💰 Fetching orders from Shopify...")
+        orders = get_all_orders()
+        
+        # Find latest subscription purchase per customer
+        latest_purchase = {}
+        now = datetime.utcnow()
+        
+        for o in orders:
+            cid = o.get("customer_id")
+            created = o.get("created_at")
+            order_id = o.get("order_id")
+            if not cid or not created:
+                continue
+            
+            # Check all product IDs in the order
+            all_product_ids = o.get("line_item_product_ids", [])
+            if not all_product_ids:
+                first_pid = o.get("line_item_0_product_id")
+                if first_pid:
+                    all_product_ids = [first_pid]
+            
+            # Find subscription product
+            subscription_pid = None
+            for pid in all_product_ids:
+                try:
+                    pid_int = int(pid)
+                    if pid_int in SUBSCRIPTION_PRODUCT_IDS:
+                        subscription_pid = pid_int
+                        break
+                except (TypeError, ValueError):
+                    continue
+            
+            if not subscription_pid:
+                continue
+                
+            try:
+                created_dt = _parse_shopify_dt(created)
+            except Exception:
+                created_dt = now
+
+            prev = latest_purchase.get(cid)
+            if not prev or created_dt > prev[1]:
+                latest_purchase[cid] = (subscription_pid, created_dt, order_id)
+
+        # Apply subscription info to users
+        updated_count = 0
+        for cid, (pid, created_dt, order_id) in latest_purchase.items():
+            user = sess.query(User).filter_by(customer_id=cid).first()
+            if not user:
+                continue
+
+            if pid == TIER1_PRODUCT_ID:
+                user.plan = "tier1"
+                user.remaining_uses = TIER1_USES
+            elif pid == TIER2_PRODUCT_ID:
+                user.plan = "tier2"
+                user.remaining_uses = None
+            elif pid == PRO_PRODUCT_ID:
+                user.plan = "pro"
+                user.remaining_uses = None
+
+            user.plan_product_id = pid
+            user.expiry = created_dt + timedelta(days=ACCESS_DAYS)
+            
+            try:
+                user.last_subscription_order_id = order_id
+                user.last_subscription_purchase_at = created_dt
+                user.last_shopify_check_at = now
+            except Exception:
+                pass
+                
+            updated_count += 1
+
+        sess.commit()
+        print(f"✅ Updated {updated_count} users with subscription info")
+        
+        total = sess.query(User).count()
+        print(f"📊 Total users in database: {total}")
+        
+        sess.close()
+        return {"customers_created": created_count, "subscriptions_updated": updated_count, "total_users": total}
+        
+    except Exception as e:
+        sess.close()
+        print(f"❌ Error initializing database: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
+
+
+def check_and_initialize_db():
+    """Check if database is empty and initialize if needed."""
+    sess = Session()
+    try:
+        user_count = sess.query(User).count()
+        sess.close()
+        
+        if user_count == 0:
+            print("📭 Database is empty, initializing from Shopify...")
+            return initialize_database_from_shopify()
+        else:
+            print(f"📊 Database has {user_count} users")
+            return None
+    except Exception as e:
+        sess.close()
+        print(f"Error checking database: {e}")
+        return None
+
+
+# Auto-initialize on startup (optional - can be disabled in production)
+AUTO_INIT_ON_STARTUP = os.getenv("AUTO_INIT_DB", "true").lower() == "true"
+if AUTO_INIT_ON_STARTUP:
+    try:
+        check_and_initialize_db()
+    except Exception as e:
+        print(f"Startup initialization error (non-fatal): {e}")
 
 # -----------------------------
 # Tiny in-memory TTL cache
@@ -504,10 +672,11 @@ def validate_submission():
 # -----------------------------
 # Admin dashboard endpoints
 # -----------------------------
-@app.route("/admin/dashboard", methods=["GET"])
-def admin_dashboard():
+@app.route("/admin/init-database", methods=["POST"])
+def admin_init_database():
     """
-    Admin dashboard - returns all users with subscription and trial status.
+    Initialize database from Shopify - fetches all customers and orders.
+    Use this to populate an empty database or refresh all data.
     Protected by ADMIN_DASHBOARD_TOKEN.
     """
     token = request.headers.get("X-ADMIN-TOKEN") or request.args.get("token")
@@ -516,6 +685,80 @@ def admin_dashboard():
     if not expected_token or token != expected_token:
         return jsonify({"ok": False, "reason": "unauthorized"}), 401
 
+    try:
+        result = initialize_database_from_shopify()
+        return jsonify({
+            "ok": True,
+            "message": "Database initialized from Shopify",
+            **result
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/admin/db-status", methods=["GET"])
+def admin_db_status():
+    """
+    Check database status - shows path, user count, and if DB file exists.
+    Protected by ADMIN_DASHBOARD_TOKEN.
+    """
+    token = request.headers.get("X-ADMIN-TOKEN") or request.args.get("token")
+    expected_token = os.getenv("ADMIN_DASHBOARD_TOKEN")
+    
+    if not expected_token or token != expected_token:
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    sess = Session()
+    try:
+        user_count = sess.query(User).count()
+        trial_not_used = sess.query(User).filter_by(trial_used=False).count()
+        trial_used = sess.query(User).filter_by(trial_used=True).count()
+        
+        # Check if DB file exists
+        db_file_exists = os.path.exists(DEFAULT_DB_PATH)
+        db_file_size = os.path.getsize(DEFAULT_DB_PATH) if db_file_exists else 0
+        
+        sess.close()
+        
+        return jsonify({
+            "ok": True,
+            "database": {
+                "path": DB_PATH,
+                "file_exists": db_file_exists,
+                "file_size_bytes": db_file_size,
+                "file_size_kb": round(db_file_size / 1024, 2) if db_file_size else 0,
+            },
+            "stats": {
+                "total_users": user_count,
+                "trial_not_used": trial_not_used,
+                "trial_used": trial_used,
+            }
+        })
+    except Exception as e:
+        sess.close()
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/admin/dashboard", methods=["GET"])
+def admin_dashboard():
+    """
+    Admin dashboard - returns all users with subscription and trial status.
+    ALWAYS reads fresh from database (no cache).
+    Protected by ADMIN_DASHBOARD_TOKEN.
+    """
+    token = request.headers.get("X-ADMIN-TOKEN") or request.args.get("token")
+    expected_token = os.getenv("ADMIN_DASHBOARD_TOKEN")
+    
+    if not expected_token or token != expected_token:
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    # Always read fresh from database - no cache
     sess = Session()
     users = sess.query(User).order_by(User.created_at.desc()).all()
     now = datetime.utcnow()
@@ -561,8 +804,17 @@ def admin_dashboard():
     tier2_users = sum(1 for u in data if u["plan"] == "tier2" and u["subscription_active"])
     pro_users = sum(1 for u in data if u["plan"] == "pro" and u["subscription_active"])
     
+    # Database info
+    db_file_exists = os.path.exists(DEFAULT_DB_PATH)
+    db_file_size = os.path.getsize(DEFAULT_DB_PATH) if db_file_exists else 0
+    
     return jsonify({
         "ok": True,
+        "database": {
+            "path": DB_PATH,
+            "file_exists": db_file_exists,
+            "file_size_kb": round(db_file_size / 1024, 2) if db_file_size else 0,
+        },
         "summary": {
             "total_users": total_users,
             "trial_not_used": trial_not_used,

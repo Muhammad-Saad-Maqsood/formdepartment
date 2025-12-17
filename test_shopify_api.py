@@ -87,8 +87,9 @@ def get_all_orders():
     next_page_info = None
 
     while True:
+        # When using page_info, we can't include other params except limit
         if next_page_info:
-            params["page_info"] = next_page_info
+            params = {"limit": 250, "page_info": next_page_info}
 
         response = requests.get(url, headers=HEADERS, params=params)
         if response.status_code != 200:

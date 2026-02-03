@@ -34,17 +34,16 @@ from test_shopify_api import (
 # -----------------------------
 # Subscription constants
 # -----------------------------
+# Tier 1: $29/month - Unlimited access to Product Breakdown page only
 TIER1_PRODUCT_ID = 8424668299439
+# Tier 2: $99/month - Unlimited access to both Product Breakdown and Market Analysis pages
 TIER2_PRODUCT_ID = 8424683241647
-PRO_PRODUCT_ID   = 8424226160815
 
 SUBSCRIPTION_PRODUCT_IDS = {
     TIER1_PRODUCT_ID,
     TIER2_PRODUCT_ID,
-    PRO_PRODUCT_ID,
 }
 
-TIER1_USES = 10
 ACCESS_DAYS = 30
 
 SUBSCRIPTION_PAGE = settings.plan_page_url
@@ -212,13 +211,10 @@ def initialize_database_from_shopify():
 
             if pid == TIER1_PRODUCT_ID:
                 user.plan = "tier1"
-                user.remaining_uses = TIER1_USES
+                user.remaining_uses = None  # Unlimited access (no usage limits)
             elif pid == TIER2_PRODUCT_ID:
                 user.plan = "tier2"
-                user.remaining_uses = None
-            elif pid == PRO_PRODUCT_ID:
-                user.plan = "pro"
-                user.remaining_uses = None
+                user.remaining_uses = None  # Unlimited access
 
             user.plan_product_id = pid
             user.expiry = created_dt + timedelta(days=ACCESS_DAYS)
@@ -380,14 +376,10 @@ def refresh_customer_subscription(sess, user: User, max_age_seconds: int = 300, 
 
     if pid == TIER1_PRODUCT_ID:
         user.plan = "tier1"
-        if is_new_order:
-            user.remaining_uses = TIER1_USES
+        user.remaining_uses = None  # Unlimited access (no usage limits)
     elif pid == TIER2_PRODUCT_ID:
         user.plan = "tier2"
-        user.remaining_uses = None
-    elif pid == PRO_PRODUCT_ID:
-        user.plan = "pro"
-        user.remaining_uses = None
+        user.remaining_uses = None  # Unlimited access
 
     user.plan_product_id = pid
     user.expiry = created_dt + timedelta(days=ACCESS_DAYS)
@@ -477,10 +469,7 @@ def proxy_tool():
     # Get plan info if subscribed
     plan_info = None
     if has_active_subscription:
-        if user.plan == "tier1":
-            plan_info = {"plan": "tier1", "remaining_uses": user.remaining_uses}
-        else:
-            plan_info = {"plan": user.plan}
+        plan_info = {"plan": user.plan}
 
     # Build response - always allow tool access
     # NOTE: trial_used is NOT modified here - only in validate-submission
@@ -490,7 +479,7 @@ def proxy_tool():
         "show_trial_banner": not user.trial_used,
         "has_subscription": has_active_subscription,
         "plan": plan_info.get("plan") if plan_info else None,
-        "remaining_uses": plan_info.get("remaining_uses") if plan_info else None,
+        "is_admin": is_admin(user),
         "tool_url": TOOL_URL,
     }
 
@@ -613,46 +602,14 @@ def validate_submission():
                     "message": "Please subscribe to continue"
                 }), 403
 
-            # User has active subscription - check tier1 usage limits
-            if user.plan == "tier1":
-                if user.remaining_uses is None:
-                    sess.close()
-                    return jsonify({
-                        "ok": False,
-                        "reason": "subscription_data_error",
-                        "message": "Tier1 user missing remaining_uses in DB"
-                    }), 500
-
-                if user.remaining_uses <= 0:
-                    sess.close()
-                    return jsonify({
-                        "ok": False,
-                        "reason": "tier1_exhausted",
-                        "redirect": SUBSCRIPTION_PAGE,
-                        "message": "You have exhausted your usage limit. Please upgrade."
-                    }), 403
-
-                # Decrement usage for tier1
-                user.remaining_uses -= 1
-                sess.commit()
-                remaining = user.remaining_uses
-                
-                # Invalidate cache
-                tool_cache.delete(f"tool:{cid}")
-                
-                sess.close()
-                return jsonify({
-                    "ok": True,
-                    "plan": "tier1",
-                    "remaining_uses": remaining
-                }), 200
-
-            # tier2 or pro: unlimited access
+            # User has active subscription - both tiers have unlimited access
+            # No usage limits - both Tier 1 and Tier 2 can submit unlimited times
             tool_cache.delete(f"tool:{cid}")
             sess.close()
             return jsonify({
                 "ok": True,
-                "plan": user.plan
+                "plan": user.plan,
+                "is_admin": is_admin(user)
             }), 200
             
         except Exception as e:
@@ -668,6 +625,119 @@ def validate_submission():
             "reason": "server_error",
             "message": str(e)
         }), 500
+
+# -----------------------------
+# Page access control
+# -----------------------------
+@app.route("/proxy/check-page-access", methods=["GET"])
+def check_page_access():
+    """
+    Check if user's tier allows access to requested page.
+    Pages: 'product-breakdown', 'market-analysis'
+    
+    Returns:
+    - {"ok": True, "allowed": True/False, "plan": "tier1/tier2/admin"}
+    - {"ok": False, "reason": "...", "redirect": "..."}
+    """
+    try:
+        customer_id = request.args.get("customer_id") or request.args.get("logged_in_customer_id")
+        page = request.args.get("page")  # 'product-breakdown' or 'market-analysis'
+        
+        if not customer_id:
+            return jsonify({"ok": False, "reason": "missing_customer_id"}), 400
+        
+        if not page:
+            return jsonify({"ok": False, "reason": "missing_page"}), 400
+        
+        if not customer_id.isdigit() or len(customer_id) != 13:
+            return jsonify({"ok": False, "reason": "invalid_customer_id"}), 400
+        
+        cid = int(customer_id)
+        sess = Session()
+        
+        try:
+            user = sess.query(User).filter_by(customer_id=cid).first()
+            
+            if not user:
+                sess.close()
+                return jsonify({
+                    "ok": False,
+                    "reason": "user_not_found",
+                    "redirect": SUBSCRIPTION_PAGE
+                }), 404
+            
+            # Admin has full access
+            if is_admin(user):
+                sess.close()
+                return jsonify({
+                    "ok": True,
+                    "allowed": True,
+                    "plan": "admin"
+                }), 200
+            
+            # Check subscription status
+            now = datetime.utcnow()
+            has_active_subscription = (
+                user.plan and 
+                user.plan != "none" and 
+                user.expiry and 
+                now <= user.expiry
+            )
+            
+            if not has_active_subscription:
+                sess.close()
+                return jsonify({
+                    "ok": False,
+                    "reason": "no_active_subscription",
+                    "redirect": SUBSCRIPTION_PAGE,
+                    "message": "Please subscribe to access this page"
+                }), 403
+            
+            # Check page access based on tier
+            plan = user.plan.lower()
+            allowed = False
+            
+            if page == "product-breakdown":
+                # Both Tier 1 and Tier 2 can access Product Breakdown
+                allowed = plan in ["tier1", "tier2"]
+            elif page == "market-analysis":
+                # Only Tier 2 can access Market Analysis
+                allowed = plan == "tier2"
+            else:
+                sess.close()
+                return jsonify({
+                    "ok": False,
+                    "reason": "invalid_page",
+                    "message": f"Unknown page: {page}"
+                }), 400
+            
+            sess.close()
+            
+            if allowed:
+                return jsonify({
+                    "ok": True,
+                    "allowed": True,
+                    "plan": plan
+                }), 200
+            else:
+                return jsonify({
+                    "ok": True,
+                    "allowed": False,
+                    "plan": plan,
+                    "reason": "tier_restriction",
+                    "message": "This page requires Tier 2 subscription. Please upgrade.",
+                    "redirect": SUBSCRIPTION_PAGE
+                }), 403
+                
+        except Exception as e:
+            sess.close()
+            raise e
+            
+    except Exception as e:
+        print(f"Page access check error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "reason": "server_error", "message": str(e)}), 500
 
 # -----------------------------
 # Admin dashboard endpoints
@@ -802,7 +872,6 @@ def admin_dashboard():
     active_subscribers = sum(1 for u in data if u["subscription_active"])
     tier1_users = sum(1 for u in data if u["plan"] == "tier1" and u["subscription_active"])
     tier2_users = sum(1 for u in data if u["plan"] == "tier2" and u["subscription_active"])
-    pro_users = sum(1 for u in data if u["plan"] == "pro" and u["subscription_active"])
     
     # Database info
     db_file_exists = os.path.exists(DEFAULT_DB_PATH)
@@ -822,7 +891,6 @@ def admin_dashboard():
             "active_subscribers": active_subscribers,
             "tier1_users": tier1_users,
             "tier2_users": tier2_users,
-            "pro_users": pro_users,
         },
         "users": data
     })
@@ -969,14 +1037,10 @@ def admin_sync_subscriptions():
 
         if pid == TIER1_PRODUCT_ID:
             user.plan = "tier1"
-            if is_new_order or user.remaining_uses is None:
-                user.remaining_uses = TIER1_USES
+            user.remaining_uses = None  # Unlimited access (no usage limits)
         elif pid == TIER2_PRODUCT_ID:
             user.plan = "tier2"
-            user.remaining_uses = None
-        elif pid == PRO_PRODUCT_ID:
-            user.plan = "pro"
-            user.remaining_uses = None
+            user.remaining_uses = None  # Unlimited access
 
         user.plan_product_id = pid
         user.expiry = created_dt + timedelta(days=ACCESS_DAYS)

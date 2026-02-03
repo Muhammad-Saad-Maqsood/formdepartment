@@ -8,9 +8,9 @@ from config import load_settings
 
 
 SUBSCRIPTION_PRODUCT_IDS = {
-    8424668299439,  # Tier 1
-    8424683241647,  # Tier 2
-    8424226160815   # Pro Tier
+    8424668299439,  # Tier 1 - $29/month
+    8424683241647,  # Tier 2 - $99/month
+    # Pro Tier removed - no longer available
 }
 
 

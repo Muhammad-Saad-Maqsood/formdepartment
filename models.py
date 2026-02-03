@@ -13,10 +13,10 @@ class User(Base):
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
 
-    plan = Column(String, default="none")   # none | tier1 | tier2 | pro
+    plan = Column(String, default="none")   # none | tier1 | tier2
     plan_product_id = Column(BigInteger, nullable=True)
     expiry = Column(DateTime, nullable=True)       # purchase_created_at + 30 days
-    remaining_uses = Column(Integer, nullable=True) # integer for tier1, None for unlimited
+    remaining_uses = Column(Integer, nullable=True) # Deprecated - kept for legacy data. Both tiers now have unlimited access.
     trial_used = Column(Boolean, default=False)
 
     # Subscription bookkeeping for optimized per-customer validation

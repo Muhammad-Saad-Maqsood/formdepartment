@@ -675,6 +675,16 @@ def check_page_access():
                     "plan": "admin"
                 }), 200
             
+            # FREE TRIAL: Users who haven't used their trial get full access to all pages
+            if not user.trial_used:
+                sess.close()
+                return jsonify({
+                    "ok": True,
+                    "allowed": True,
+                    "plan": "trial",
+                    "message": "Free trial access granted"
+                }), 200
+            
             # Check subscription status
             now = datetime.utcnow()
             has_active_subscription = (
